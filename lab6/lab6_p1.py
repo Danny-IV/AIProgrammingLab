@@ -1,14 +1,17 @@
 import torch
 from torch import nn
-import torch.optim.adam
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torch.optim.lr_scheduler import OneCycleLR
 import random
 import matplotlib.pyplot as plt
 import numpy as np
+import sys
 
 
 class FashionMNISTTrainer:
+    """Guess fashion label at 28x28 image"""
+
     def __init__(self, seed=2025):
         """Initialize fashion MNIST trainer
         set seed, load dataset, set model"""
@@ -47,134 +50,155 @@ class FashionMNISTTrainer:
         self.set_model()
 
     def check_device(self):
+        """Checks device, running on self.device"""
         print(f"Running on {self.device}.")
 
     def set_model(self):
-        """
-        write your docstring...
-        """
+        """Initializes CNN model with optimized architecture for Fashion-MNIST"""
 
-        ### write your code...
-        # 1. set network
-        linear1 = nn.Linear(784, 512, bias=True)
-        linear2 = nn.Linear(512, 512, bias=True)
-        linear3 = nn.Linear(512, 10, bias=True)
+        # 1. Define CNN layers
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)  # 28x28x32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)  # 14x14x64
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)  # 7x7x128
 
-        # 2. initialize weight (if needed)
-        nn.init.xavier_uniform(linear1.weight)
-        nn.init.xavier_uniform(linear2.weight)
-        nn.init.xavier_uniform(linear3.weight)
+        # 2. Initialize weights with Xavier uniform
+        for conv in [self.conv1, self.conv2, self.conv3]:
+            nn.init.xavier_uniform_(conv.weight)
+            nn.init.constant_(conv.bias, 0.1)
 
-        # 3. set activation function
-        act_func = nn.ReLU()
+        # 3. Define network components
+        self.pool = nn.MaxPool2d(2)
+        self.dropout = nn.Dropout(0.25)
+        self.activation = nn.ReLU()
 
-        # 4. set model
-        self.model = nn.Sequential(linear1, act_func, linear2, act_func, linear3).to(
-            self.device
+        # 4. Build sequential model
+        self.model = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),  # 28x28x32
+            nn.BatchNorm2d(32),
+            self.activation,
+            self.pool,  # 14x14x32
+            nn.Conv2d(32, 64, 3, padding=1),  # 14x14x64
+            nn.BatchNorm2d(64),
+            self.activation,
+            self.pool,  # 7x7x64
+            nn.Conv2d(64, 128, 3, padding=1),  # 7x7x128
+            nn.BatchNorm2d(128),
+            self.activation,
+            self.pool,  # 3x3x128
+            nn.Flatten(),
+            nn.Linear(128 * 3 * 3, 256),
+            self.activation,
+            self.dropout,
+            nn.Linear(256, 10),
+        ).to(self.device)
+
+        # 5. Configure loss and optimizer
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=0.001, weight_decay=1e-4
         )
 
-        # 5. set loss and optimizer
-        self.criterion = nn.CrossEntropyLoss().to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
-
     def train(self):
-        """
-        write your docstring...
-        """
-
-        # train your model here
-        # you may print the loss of your model
-
-        # if you are running this code on 'cuda', (check by calling check_device())
-        # you have to pass your image to device by using '.to(self.device)'
-        # the same applies to function eval(...):
-
-        # set to train mode
+        """Enhanced training loop with learning rate scheduling"""
         self.model.train()
 
-        batch_num = len(self.train_data_loader)
         epoch_num = 20
 
-        cost_log = []
+        scheduler = OneCycleLR(
+            self.optimizer,
+            max_lr=0.005,
+            steps_per_epoch=len(self.train_data_loader),
+            epochs=epoch_num,
+            pct_start=0.3,
+            anneal_strategy="cos",
+        )
+
         for epoch in range(epoch_num):
-            avg_cost = 0
+            running_loss = 0.0
+            correct = 0
+            total = 0
 
-            for X, Y in self.train_data_loader:  # X is image, Y is label (0~9)
-                X = X.view(-1, 28 * 28).to(self.device)
-                Y = Y.to(self.device)
-                self.optimizer.zero_grad()  # Initialize gradients to 0
-                guess = self.model(X)  # Model's guess
-                cost = self.criterion(guess, Y)  # Loss
-                cost.backward()  # Compute gradient
-                self.optimizer.step()  # Update weights
-                avg_cost += cost / batch_num
+            for batch_idx, (images, labels) in enumerate(self.train_data_loader):
+                images = images.to(self.device)
+                labels = labels.to(self.device)
 
-            cost_log.append(float(avg_cost))
-            print(f"Epoch: {epoch+1:02d}, cost={avg_cost:.9f}")
+                # Forward-backward pass
+                self.optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
 
-        plt.plot(np.arange(epoch_num), cost_log)
-        plt.xlabel("Epoch")
-        plt.ylabel("Cost")
-        plt.show()
-        print("Model training complete!")
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                self.optimizer.step()
+                scheduler.step()
+
+                # Track metrics
+                running_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+            # Epoch statistics
+            epoch_acc = 100 * correct / total
+            current_lr = scheduler.get_last_lr()[0]
+
+            print(
+                f"Epoch {epoch+1}/{epoch_num} \t Loss: {running_loss/len(self.train_data_loader):.4f} Acc: {epoch_acc:.2f}% \t LR: {current_lr:.6f}"
+            )
 
     @torch.no_grad()
     def eval(self, image):
-        """
-        write your docstring...
-        """
-
-        # image will have size of 28 * 28
-        # you should return the label predicted by your model
-        # this function only predicts the label of a single image
-
-        # set model to eval mode
+        """Enhanced evaluation with input validation"""
         self.model.eval()
 
-        X_test = self.test_data.test_data.view(-1, 28 * 28).float().to(self.device)
-        Y_test = self.test_data.test_labels.to(self.device)
+        # Input dimension handling
+        if image.dim() == 2:
+            image = image.unsqueeze(0).unsqueeze(0)  # Add channel & batch dim
+        elif image.dim() == 3:
+            image = image.unsqueeze(0)  # Add batch dim
 
-        prediction = self.model(X_test)  # Pass 10k images and predict their label
-        correct_pred = torch.argmax(prediction, 1) == Y_test  # True if correct
-        accuracy = correct_pred.float().mean()
-
-        # Select random MNIST image and test on it
-        r = random.randint(0, len(self.test_data) - 1)
-        X_single_data = (
-            self.test_data.test_data[r : r + 1]
-            .view(-1, 28 * 28)
-            .float()
-            .to(self.device)
-        )
-        Y_single_data = self.test_data.test_labels[r : r + 1].to(self.device)
-        single_pred = self.model(X_single_data)
-
-        predicted_label = torch.argmax(single_pred, 1).item()
-
-        return predicted_label
+        image = image.to(self.device)
+        outputs = self.model(image)
+        return torch.argmax(outputs).item()
 
     def eval_all(self):
+        """evaluate all images which are in test data"""
         acc_cnt, tot_cnt = 0, 0
         for image, label in self.test_data:
             pred = self.eval(image)
             acc_cnt += label == pred
             tot_cnt += 1
-            print(f"cnt: {tot_cnt} / {len(self.test_data)}")
 
-        print(f"Accuracy: {acc_cnt / tot_cnt * 100:.2f}%")
+            # 진행률 표시
+            progress = (tot_cnt + 1) / len(self.test_data)
+            bar_length = 40
+            bar = "#" * int(bar_length * progress) + "-" * (
+                bar_length - int(bar_length * progress)
+            )
+            sys.stdout.write(
+                f"\r|{bar}| {progress*100:.1f}% ({tot_cnt+1}/{len(self.test_data)})"
+            )
+            sys.stdout.flush()
+
+        print(f"\nAccuracy: {acc_cnt / tot_cnt * 100:.2f}%")
 
     def sample_test_image(self):
+        """test with a random sample image"""
         r = self.random.integers(low=0, high=len(self.test_data))
         return self.test_data[r]
 
     def export_model(self, file_name="lab6_p1.pth"):
+        """export model to a .pth file"""
         torch.save(self.model.state_dict(), file_name)
 
     def import_model(self, file_name="lab6_p1.pth"):
+        """import model by reading .pth file"""
         state_dict = torch.load(file_name, map_location=torch.device(self.device))
         self.model.load_state_dict(state_dict)
 
     def set_seed(self, seed=2025):
+        """set seed, fixe seed at 2025"""
         self.random = np.random.default_rng(seed)
 
 
